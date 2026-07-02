@@ -90,25 +90,103 @@ function build() {
         console.log(`Processed ${type}: ${counts[type]} images.`);
     });
 
-    // 2.5 Write counts.json + copy serverless function files to dist
-    // 随机图 URL 端点（/random/{h,v}）需要读取这个文件
+    // 2.5 Write counts.json + 重新生成服务端函数（COUNTS 直接内联，零依赖 fetch）
     fs.writeFileSync(
         path.join(DIST, 'counts.json'),
         JSON.stringify(counts, null, 2)
     );
     console.log(`Wrote dist/counts.json: ${JSON.stringify(counts)}`);
 
-    // 把项目根的 functions/ 和 edge-functions/ 也镜像到 dist/，
-    // 这样无论从 dist 部署（edgeone makers deploy ./dist）
-    // 还是从根部署（wrangler pages deploy），都拿得到函数
-    for (const folder of ['functions', 'edge-functions']) {
-        const src = path.join(ROOT, folder);
-        const dst = path.join(DIST, folder);
-        if (fs.existsSync(src)) {
-            fs.cpSync(src, dst, { recursive: true });
-            console.log(`Copied ${folder}/ into dist/`);
+    const funcTemplate = (platformLabel) => `/**
+ * 随机图 URL 端点（构建时由 build.js 生成）
+ * 平台: ${platformLabel}
+ * COUNTS 由构建脚本注入，无需 fetch
+ */
+const COUNTS = ${JSON.stringify(counts)};
+
+function jsonResponse(body, status) {
+    return new Response(JSON.stringify(body, null, 2), {
+        status,
+        headers: { 'content-type': 'application/json; charset=utf-8' }
+    });
+}
+
+export async function onRequest(context) {
+    try {
+        const { request, params } = context;
+        const url = new URL(request.url);
+        let type = String(params.type || '').replace(/\\/$/, '');
+
+        if (type !== 'h' && type !== 'v') {
+            return jsonResponse({ error: 'Invalid type. Use /random/h or /random/v.' }, 400);
         }
+
+        const total = COUNTS[type];
+        if (!total || total < 1) {
+            return jsonResponse({ error: 'No images for type ' + type }, 404);
+        }
+
+        const idx = Math.floor(Math.random() * total) + 1;
+        return Response.redirect(new URL('/ri/' + type + '/' + idx + '.webp', url), 302);
+    } catch (e) {
+        return jsonResponse({
+            error: 'function crashed',
+            message: e && e.message,
+            stack: e && e.stack
+        }, 500);
     }
+}
+`;
+
+    // 调试端点：返回注入的 COUNTS，方便排查
+    const statusTemplate = `/**
+ * 调试端点 /api/status（构建时由 build.js 生成）
+ */
+const COUNTS = ${JSON.stringify(counts)};
+const BUILD_TIME = ${JSON.stringify(new Date().toISOString())};
+
+export async function onRequest(context) {
+    try {
+        const url = new URL(context.request.url);
+        return new Response(JSON.stringify({
+            ok: true,
+            counts: COUNTS,
+            build_time: BUILD_TIME,
+            url: url.href
+        }, null, 2), {
+            headers: { 'content-type': 'application/json; charset=utf-8' }
+        });
+    } catch (e) {
+        return new Response(JSON.stringify({ error: e && e.message }), { status: 500 });
+    }
+}
+`;
+
+    function writeFn(folder, name, content) {
+        const dir = path.join(ROOT, folder, name);
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, '[type].js'), content);
+        // 同步到 dist/
+        const dstDir = path.join(DIST, folder, name);
+        fs.mkdirSync(dstDir, { recursive: true });
+        fs.writeFileSync(path.join(dstDir, '[type].js'), content);
+        console.log(`Wrote ${folder}/${name}/[type].js (COUNTS baked)`);
+    }
+
+    function writeStatus(folder) {
+        const dir = path.join(ROOT, folder, 'api', 'status');
+        fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, 'index.js'), statusTemplate);
+        const dstDir = path.join(DIST, folder, 'api', 'status');
+        fs.mkdirSync(dstDir, { recursive: true });
+        fs.writeFileSync(path.join(dstDir, 'index.js'), statusTemplate);
+        console.log(`Wrote ${folder}/api/status/index.js`);
+    }
+
+    writeFn('functions', 'random', funcTemplate('Cloudflare Pages Functions'));
+    writeFn('edge-functions', 'random', funcTemplate('Tencent EdgeOne Pages Functions'));
+    writeStatus('functions');
+    writeStatus('edge-functions');
 
     // 3. Generate Single JS
     const jsContent = `
