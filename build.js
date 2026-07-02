@@ -97,10 +97,10 @@ function build() {
     );
     console.log(`Wrote dist/counts.json: ${JSON.stringify(counts)}`);
 
-    const funcTemplate = (platformLabel) => `/**
- * 随机图 URL 端点（构建时由 build.js 生成）
- * 平台: ${platformLabel}
- * COUNTS 由构建脚本注入，无需 fetch
+    function makeRandomFn(type) {
+        return `/**
+ * 随机图 URL 端点 /random/${type}（构建时由 build.js 生成）
+ * 不依赖 new URL、不依赖 params，避免方括号文件名被打包器搞坏
  */
 const COUNTS = ${JSON.stringify(counts)};
 
@@ -113,21 +113,22 @@ function jsonResponse(body, status) {
 
 export async function onRequest(context) {
     try {
-        const { request, params } = context;
-        const url = new URL(request.url);
-        let type = String(params.type || '').replace(/\\/$/, '');
+        const request = context.request;
+        const total = COUNTS['${type}'];
 
-        if (type !== 'h' && type !== 'v') {
-            return jsonResponse({ error: 'Invalid type. Use /random/h or /random/v.' }, 400);
-        }
-
-        const total = COUNTS[type];
         if (!total || total < 1) {
-            return jsonResponse({ error: 'No images for type ' + type }, 404);
+            return jsonResponse({ error: 'No images for type ${type}' }, 404);
         }
 
         const idx = Math.floor(Math.random() * total) + 1;
-        return Response.redirect(new URL('/ri/' + type + '/' + idx + '.webp', url), 302);
+        const host = (request && request.headers && request.headers.get('host')) || 'pic.olinl.com';
+        const proto = (request && request.headers && request.headers.get('x-forwarded-proto')) || 'https';
+        const target = proto + '://' + host + '/ri/${type}/' + idx + '.webp';
+
+        return new Response(null, {
+            status: 302,
+            headers: { 'location': target }
+        });
     } catch (e) {
         return jsonResponse({
             error: 'function crashed',
@@ -137,6 +138,7 @@ export async function onRequest(context) {
     }
 }
 `;
+    }
 
     // 调试端点：返回注入的 COUNTS，方便排查
     const statusTemplate = `/**
@@ -147,30 +149,51 @@ const BUILD_TIME = ${JSON.stringify(new Date().toISOString())};
 
 export async function onRequest(context) {
     try {
-        const url = new URL(context.request.url);
-        return new Response(JSON.stringify({
+        const request = context.request;
+        const host = (request && request.headers && request.headers.get('host')) || 'pic.olinl.com';
+        return jsonResp({
             ok: true,
             counts: COUNTS,
             build_time: BUILD_TIME,
-            url: url.href
-        }, null, 2), {
-            headers: { 'content-type': 'application/json; charset=utf-8' }
+            host: host,
+            path: (request && request.url) || ''
         });
     } catch (e) {
         return new Response(JSON.stringify({ error: e && e.message }), { status: 500 });
     }
 }
+
+function jsonResp(body) {
+    return new Response(JSON.stringify(body, null, 2), {
+        headers: { 'content-type': 'application/json; charset=utf-8' }
+    });
+}
 `;
 
-    function writeFn(folder, name, content) {
-        const dir = path.join(ROOT, folder, name);
+    // 写出 /random/h, /random/v 各自一个文件（不用通配）
+    function writeRandomFn(folder, type) {
+        const content = makeRandomFn(type);
+        const dir = path.join(ROOT, folder, 'random');
         fs.mkdirSync(dir, { recursive: true });
-        fs.writeFileSync(path.join(dir, '[type].js'), content);
-        // 同步到 dist/
-        const dstDir = path.join(DIST, folder, name);
+        fs.writeFileSync(path.join(dir, type + '.js'), content);
+        const dstDir = path.join(DIST, folder, 'random');
         fs.mkdirSync(dstDir, { recursive: true });
-        fs.writeFileSync(path.join(dstDir, '[type].js'), content);
-        console.log(`Wrote ${folder}/${name}/[type].js (COUNTS baked)`);
+        fs.writeFileSync(path.join(dstDir, type + '.js'), content);
+        console.log(`Wrote ${folder}/random/${type}.js (COUNTS baked, no [type])`);
+    }
+
+    // 清理可能还存在的 [type].js 旧文件，避免被意外匹配
+    for (const folder of ['functions', 'edge-functions']) {
+        const oldPath = path.join(ROOT, folder, 'random', '[type].js');
+        if (fs.existsSync(oldPath)) {
+            fs.unlinkSync(oldPath);
+            console.log(`Removed legacy ${folder}/random/[type].js`);
+        }
+        const oldDist = path.join(DIST, folder, 'random', '[type].js');
+        if (fs.existsSync(oldDist)) {
+            fs.unlinkSync(oldDist);
+            console.log(`Removed legacy dist/${folder}/random/[type].js`);
+        }
     }
 
     function writeStatus(folder) {
@@ -183,10 +206,11 @@ export async function onRequest(context) {
         console.log(`Wrote ${folder}/api/status/index.js`);
     }
 
-    writeFn('functions', 'random', funcTemplate('Cloudflare Pages Functions'));
-    writeFn('edge-functions', 'random', funcTemplate('Tencent EdgeOne Pages Functions'));
-    writeStatus('functions');
-    writeStatus('edge-functions');
+    for (const folder of ['functions', 'edge-functions']) {
+        writeRandomFn(folder, 'h');
+        writeRandomFn(folder, 'v');
+        writeStatus(folder);
+    }
 
     // 3. Generate Single JS
     const jsContent = `
