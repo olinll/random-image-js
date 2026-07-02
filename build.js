@@ -90,6 +90,26 @@ function build() {
         console.log(`Processed ${type}: ${counts[type]} images.`);
     });
 
+    // 2.5 Write counts.json + copy serverless function files to dist
+    // 随机图 URL 端点（/random/{h,v}）需要读取这个文件
+    fs.writeFileSync(
+        path.join(DIST, 'counts.json'),
+        JSON.stringify(counts, null, 2)
+    );
+    console.log(`Wrote dist/counts.json: ${JSON.stringify(counts)}`);
+
+    // 把项目根的 functions/ 和 edge-functions/ 也镜像到 dist/，
+    // 这样无论从 dist 部署（edgeone makers deploy ./dist）
+    // 还是从根部署（wrangler pages deploy），都拿得到函数
+    for (const folder of ['functions', 'edge-functions']) {
+        const src = path.join(ROOT, folder);
+        const dst = path.join(DIST, folder);
+        if (fs.existsSync(src)) {
+            fs.cpSync(src, dst, { recursive: true });
+            console.log(`Copied ${folder}/ into dist/`);
+        }
+    }
+
     // 3. Generate Single JS
     const jsContent = `
 /**
